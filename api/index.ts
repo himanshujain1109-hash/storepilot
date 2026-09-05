@@ -23,7 +23,7 @@ app.use(cors());
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
-// Cache database connection for serverless invocations
+// Cache connection in serverless memory
 let isConnected = false;
 let isSeeded = false;
 
@@ -38,32 +38,52 @@ app.use(async (req, res, next) => {
       isSeeded = true;
     }
     next();
-  } catch (err) {
+  } catch (err: any) {
     console.error('Database connection error in serverless:', err);
-    next(err);
+    res.status(500).json({
+      success: false,
+      message: 'Database connection failed. Please ensure MONGODB_URI is set in Vercel Environment Variables.',
+      error: err?.message,
+    });
   }
 });
 
 // Health check
-app.get('/api/health', (req, res) => {
+const handleHealth = (req: express.Request, res: express.Response) => {
   res.json({
     status: 'ok',
     service: 'STOCKPILOT Serverless API',
     database: getDBStatus(),
     timestamp: new Date().toISOString(),
   });
-});
+};
 
-// REST API Endpoints
-app.use('/api/products', productRoutes);
-app.use('/api/orders', orderRoutes);
-app.use('/api/warehouse', warehouseRoutes);
-app.use('/api/scan', scanRoutes);
-app.use('/api/analytics', analyticsRoutes);
-app.use('/api/activity', activityRoutes);
-app.use('/api/deliveries', deliveryRoutes);
-app.use('/api/demo', demoRoutes);
-app.use('/api/auth', authRoutes);
-app.use('/api/manufacturer', manufacturerRoutes);
+app.get('/api/health', handleHealth);
+app.get('/health', handleHealth);
+
+// Unified API Router (handles both /api/path and /path)
+const apiRouter = express.Router();
+apiRouter.use('/products', productRoutes);
+apiRouter.use('/orders', orderRoutes);
+apiRouter.use('/warehouse', warehouseRoutes);
+apiRouter.use('/scan', scanRoutes);
+apiRouter.use('/analytics', analyticsRoutes);
+apiRouter.use('/activity', activityRoutes);
+apiRouter.use('/deliveries', deliveryRoutes);
+apiRouter.use('/demo', demoRoutes);
+apiRouter.use('/auth', authRoutes);
+apiRouter.use('/manufacturer', manufacturerRoutes);
+
+app.use('/api', apiRouter);
+app.use('/', apiRouter);
+
+// Global error handler
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  console.error('Serverless API Error:', err);
+  res.status(500).json({
+    success: false,
+    message: err?.message || 'Internal Server Error',
+  });
+});
 
 export default app;
