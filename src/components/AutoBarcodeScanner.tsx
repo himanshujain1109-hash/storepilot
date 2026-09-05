@@ -15,7 +15,8 @@ import {
   Eye,
 } from 'lucide-react';
 import { playScanSuccessBeep, playScanErrorBuzzer, playCameraShutterSound } from '../utils/sound.js';
-import { decodeBarcodeFromImageFile } from '../utils/imageBarcodeDecoder.js';
+import { decodeBarcodeFromImageFile, classifyCodes } from '../utils/imageBarcodeDecoder.js';
+import { Html5Qrcode } from 'html5-qrcode';
 
 export interface AutoBarcodeScannerProps {
   id?: string;
@@ -49,6 +50,7 @@ export const AutoBarcodeScanner: React.FC<AutoBarcodeScannerProps> = ({
   expectedBarcode,
   expectedProductName,
   continuous = false,
+  cooldownMs = 2500,
   className = '',
   showControls = true,
   showQuickBarcodes = false,
@@ -61,6 +63,9 @@ export const AutoBarcodeScanner: React.FC<AutoBarcodeScannerProps> = ({
   const [selectedCameraId, setSelectedCameraId] = useState<string>('');
   const [torchEnabled, setTorchEnabled] = useState(false);
   const [hasTorchCapability, setHasTorchCapability] = useState(false);
+  const [liveDetectionSupported, setLiveDetectionSupported] = useState(false);
+  const [liveDetectionActive, setLiveDetectionActive] = useState(false);
+  const [liveDetectionMessage, setLiveDetectionMessage] = useState('Starting automatic barcode detection...');
 
   // Capture & Analysis State
   const [isCapturing, setIsCapturing] = useState(false);
@@ -72,9 +77,33 @@ export const AutoBarcodeScanner: React.FC<AutoBarcodeScannerProps> = ({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const liveDetectorRef = useRef<any>(null);
+  const liveDetectionFrameRef = useRef<number | null>(null);
+  const liveDetectionLastRunRef = useRef(0);
+  const liveDetectionBusyRef = useRef(false);
+  const liveLastDetectedRef = useRef<{ code: string; at: number } | null>(null);
+  const liveFallbackBusyRef = useRef(false);
+  const onDetectedRef = useRef(onDetected);
+
+  useEffect(() => {
+    onDetectedRef.current = onDetected;
+  }, [onDetected]);
+
+  // Stop the continuous barcode detection loop without touching the camera stream.
+  const stopLiveDetection = useCallback(() => {
+    if (liveDetectionFrameRef.current !== null) {
+      cancelAnimationFrame(liveDetectionFrameRef.current);
+      liveDetectionFrameRef.current = null;
+    }
+    liveDetectorRef.current = null;
+    liveDetectionBusyRef.current = false;
+    liveFallbackBusyRef.current = false;
+    setLiveDetectionActive(false);
+  }, []);
 
   // Safe camera stream shutdown
   const stopStream = useCallback(() => {
+    stopLiveDetection();
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => {
         try {
@@ -91,7 +120,9 @@ export const AutoBarcodeScanner: React.FC<AutoBarcodeScannerProps> = ({
     setIsStreaming(false);
     setTorchEnabled(false);
     setHasTorchCapability(false);
-  }, []);
+    setLiveDetectionSupported(false);
+    setLiveDetectionMessage('Automatic detection stopped.');
+  }, [stopLiveDetection]);
 
   // Enumerate available video input devices
   const refreshCameraList = useCallback(async () => {
@@ -114,7 +145,7 @@ export const AutoBarcodeScanner: React.FC<AutoBarcodeScannerProps> = ({
     }
   }, [selectedCameraId]);
 
-  // Start live camera stream (no auto-reading loop!)
+  // Start live camera stream with continuous automatic barcode detection
   const startCamera = useCallback(
     async (deviceIdToUse?: string) => {
       stopStream();
@@ -194,6 +225,134 @@ export const AutoBarcodeScanner: React.FC<AutoBarcodeScannerProps> = ({
     },
     [refreshCameraList, selectedCameraId, stopStream]
   );
+
+  // Continuously inspect the live camera frame. Native BarcodeDetector is used first
+  // because it is fast enough for real-time warehouse scanning. Browsers without it
+  // fall back to html5-qrcode on a throttled snapshot, while the existing Capture
+  // button remains available as the high-quality/AI fallback.
+  const startLiveDetection = useCallback(() => {
+    stopLiveDetection();
+
+    const video = videoRef.current;
+    if (!video || !isStreaming || !isActive) return;
+
+    const BarcodeDetectorCtor = (window as any).BarcodeDetector;
+    let detector: any = null;
+
+    if (BarcodeDetectorCtor) {
+      try {
+        detector = new BarcodeDetectorCtor({
+          formats: [
+            'code_128', 'code_39', 'code_93', 'ean_13', 'ean_8',
+            'upc_a', 'upc_e', 'qr_code', 'itf', 'data_matrix', 'codabar',
+          ],
+        });
+        liveDetectorRef.current = detector;
+        setLiveDetectionSupported(true);
+        setLiveDetectionMessage('Scanning live video automatically — align the barcode inside the guide.');
+      } catch (err) {
+        console.debug('Live BarcodeDetector unavailable:', err);
+      }
+    }
+
+    if (!detector) {
+      setLiveDetectionSupported(false);
+      setLiveDetectionMessage('Live native scanning is unavailable in this browser. Trying compatibility scanning automatically...');
+    }
+
+    setLiveDetectionActive(true);
+
+    const handleResults = (results: any[]) => {
+      const rawList = (results || [])
+        .map((r: any) => ({ value: r.rawValue?.trim(), format: r.format }))
+        .filter((r: any) => Boolean(r.value));
+
+      if (!rawList.length) return false;
+
+      const classified = classifyCodes(rawList);
+      const code = (classified.barcode || classified.serialNumber || '').trim();
+      if (!code) return false;
+
+      const now = Date.now();
+      const previous = liveLastDetectedRef.current;
+      if (previous && previous.code === code && now - previous.at < Math.max(cooldownMs, 1600)) {
+        return true;
+      }
+
+      liveLastDetectedRef.current = { code, at: now };
+      playScanSuccessBeep();
+      onDetectedRef.current(code, rawList[0]?.format || 'Live BarcodeDetector', classified.serialNumber || undefined);
+      return true;
+    };
+
+    const detectFrame = async (timestamp: number) => {
+      if (!videoRef.current || !streamRef.current || !isActive || capturedResult) {
+        liveDetectionFrameRef.current = null;
+        return;
+      }
+
+      if (timestamp - liveDetectionLastRunRef.current < 260) {
+        liveDetectionFrameRef.current = requestAnimationFrame(detectFrame);
+        return;
+      }
+      liveDetectionLastRunRef.current = timestamp;
+
+      if (!liveDetectionBusyRef.current && detector && video.readyState >= 2 && video.videoWidth > 0) {
+        liveDetectionBusyRef.current = true;
+        try {
+          const results = await detector.detect(video);
+          handleResults(results);
+        } catch (err) {
+          console.debug('Live barcode detection frame failed:', err);
+        } finally {
+          liveDetectionBusyRef.current = false;
+        }
+      }
+
+      liveDetectionFrameRef.current = requestAnimationFrame(detectFrame);
+    };
+
+    // Compatibility fallback: periodically feed a compressed frame to html5-qrcode
+    // when BarcodeDetector is not supported. This avoids starting a second camera.
+    let fallbackTimer: number | null = null;
+    if (!detector) {
+      fallbackTimer = window.setInterval(async () => {
+        if (liveFallbackBusyRef.current || !videoRef.current || video.readyState < 2 || !isActive || capturedResult) return;
+        liveFallbackBusyRef.current = true;
+        try {
+          const fallbackCanvas = document.createElement('canvas');
+          const sourceW = video.videoWidth || 1280;
+          const sourceH = video.videoHeight || 720;
+          const maxWidth = 1280;
+          const scale = Math.min(1, maxWidth / sourceW);
+          fallbackCanvas.width = Math.max(1, Math.round(sourceW * scale));
+          fallbackCanvas.height = Math.max(1, Math.round(sourceH * scale));
+          const ctx = fallbackCanvas.getContext('2d');
+          if (!ctx) return;
+          ctx.drawImage(video, 0, 0, fallbackCanvas.width, fallbackCanvas.height);
+          const blob = await new Promise<Blob | null>((resolve) => fallbackCanvas.toBlob(resolve, 'image/jpeg', 0.82));
+          if (!blob) return;
+          const file = new File([blob], `live-scan-${Date.now()}.jpg`, { type: 'image/jpeg' });
+          const reader = new Html5Qrcode(`sp-live-fallback-${id.replace(/[^a-zA-Z0-9_-]/g, '')}`);
+          // html5-qrcode's scanFile path performs local image decoding only here;
+          // the full Capture action remains responsible for the AI Vision fallback.
+          const decoded = await reader.scanFile(file, false).catch(() => '');
+          try { await reader.clear(); } catch {}
+          if (decoded) handleResults([{ rawValue: decoded, format: 'html5-qrcode' }]);
+        } catch (err) {
+          console.debug('Compatibility live scan failed:', err);
+        } finally {
+          liveFallbackBusyRef.current = false;
+        }
+      }, 1400);
+    }
+
+    liveDetectionFrameRef.current = requestAnimationFrame(detectFrame);
+
+    return () => {
+      if (fallbackTimer !== null) window.clearInterval(fallbackTimer);
+    };
+  }, [capturedResult, cooldownMs, id, isActive, isStreaming, stopLiveDetection]);
 
   // Toggle torch / flashlight
   const toggleTorch = async () => {
@@ -398,6 +557,20 @@ export const AutoBarcodeScanner: React.FC<AutoBarcodeScannerProps> = ({
     }
   }, [isActive, startCamera, stopStream]);
 
+  // Start/stop continuous detection as soon as the camera stream is ready.
+  useEffect(() => {
+    if (!isActive || !isStreaming || capturedResult) {
+      stopLiveDetection();
+      return;
+    }
+
+    const cleanup = startLiveDetection();
+    return () => {
+      cleanup?.();
+      stopLiveDetection();
+    };
+  }, [capturedResult, isActive, isStreaming, startLiveDetection, stopLiveDetection]);
+
   const sampleTestCodes = [
     { label: 'Wireless Mouse', code: '8901001001' },
     { label: 'Mouse S/N', code: 'SN-WM-8901-01' },
@@ -425,6 +598,9 @@ export const AutoBarcodeScanner: React.FC<AutoBarcodeScannerProps> = ({
         </div>
       )}
 
+      {/* Hidden DOM host required by html5-qrcode compatibility image decoding */}
+      <div id={`sp-live-fallback-${id.replace(/[^a-zA-Z0-9_-]/g, '')}`} className="fixed left-[-10000px] top-[-10000px] h-px w-px overflow-hidden opacity-0 pointer-events-none" aria-hidden="true" />
+
       {/* Main Viewport Container */}
       <div
         className="relative w-full overflow-hidden bg-black flex items-center justify-center select-none"
@@ -447,6 +623,20 @@ export const AutoBarcodeScanner: React.FC<AutoBarcodeScannerProps> = ({
               style={{ minHeight: height }}
             />
 
+            {/* Continuous automatic detection status */}
+            {isStreaming && !isAnalyzing && (
+              <div className="pointer-events-none absolute left-1/2 top-4 z-20 -translate-x-1/2">
+                <div className={`inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-[11px] font-bold backdrop-blur-md border shadow-lg ${
+                  liveDetectionActive
+                    ? 'bg-emerald-950/80 text-emerald-300 border-emerald-500/40'
+                    : 'bg-slate-950/80 text-slate-300 border-slate-700'
+                }`}>
+                  <span className={`h-2 w-2 rounded-full ${liveDetectionActive ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'}`} />
+                  {liveDetectionActive ? (liveDetectionSupported ? 'LIVE AUTO-DETECTION ON' : 'COMPATIBILITY AUTO-SCAN ON') : 'Starting Auto-Scan...'}
+                </div>
+              </div>
+            )}
+
             {/* Viewfinder Target Reticle Frame */}
             {isStreaming && !isAnalyzing && (
               <div className="pointer-events-none absolute inset-0 z-10 flex flex-col justify-between p-6 sm:p-8">
@@ -464,7 +654,7 @@ export const AutoBarcodeScanner: React.FC<AutoBarcodeScannerProps> = ({
                 <div className="relative w-full my-auto flex flex-col items-center">
                   <div className="h-0.5 w-4/5 bg-linear-to-r from-transparent via-emerald-400 to-transparent shadow-[0_0_10px_#34d399]" />
                   <span className="mt-2 text-[10px] text-slate-300 bg-black/50 px-2 py-0.5 rounded backdrop-blur-xs">
-                    Press "Capture & Read" button below
+                    {liveDetectionMessage}
                   </span>
                 </div>
 
@@ -620,7 +810,7 @@ export const AutoBarcodeScanner: React.FC<AutoBarcodeScannerProps> = ({
             <RefreshCw className="h-8 w-8 animate-spin text-emerald-400 mb-2" />
             <p className="text-sm font-semibold text-slate-100">Connecting Camera...</p>
             <p className="text-xs text-slate-400 max-w-xs mt-0.5">
-              Opening camera view for manual capture & barcode extraction
+              Opening camera view and starting automatic barcode detection
             </p>
           </div>
         )}
@@ -633,7 +823,7 @@ export const AutoBarcodeScanner: React.FC<AutoBarcodeScannerProps> = ({
             </div>
             <p className="text-sm font-semibold text-slate-200">Camera Scanner Standby</p>
             <p className="text-xs text-slate-400 max-w-xs mt-1 mb-4">
-              Click Start to open the live camera, aim at any barcode, and capture to read.
+              Open the live camera, aim at any barcode, and it will be detected automatically.
             </p>
           </div>
         )}
@@ -685,11 +875,11 @@ export const AutoBarcodeScanner: React.FC<AutoBarcodeScannerProps> = ({
 
                 <div className="text-left leading-tight">
                   <div className="text-sm font-black tracking-wide flex items-center gap-1.5">
-                    <span>CAPTURE & READ BARCODE</span>
+                    <span>CAPTURE & READ (BACKUP)</span>
                     <ArrowRight className="h-4 w-4 group-hover:translate-x-1 transition-transform" />
                   </div>
                   <div className="text-[10px] text-emerald-100 font-normal">
-                    Snaps photo and decodes barcode & S/N numbers
+                    Use a high-resolution snapshot if live detection cannot read the barcode
                   </div>
                 </div>
               </button>
@@ -709,7 +899,7 @@ export const AutoBarcodeScanner: React.FC<AutoBarcodeScannerProps> = ({
                 {capturedResult
                   ? 'Snapshot Captured'
                   : isStreaming
-                  ? 'Camera Ready — Align & Capture'
+                  ? 'Live Auto-Scan — Align Barcode'
                   : 'Scanner Standby'}
               </span>
             </div>
